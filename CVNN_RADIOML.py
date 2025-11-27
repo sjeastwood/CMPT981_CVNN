@@ -17,10 +17,12 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # Data loading
+
+# Adjust this path
 data_loc = "/mnt/i/RADIOML/"
 
+# Adjust this number of samples for training and testing
 N = 1000
-
 
 with h5py.File(data_loc + "GOLD_XYZ_OSC.0001_1024.hdf5", "r") as f:
     print(list(f.keys()))   
