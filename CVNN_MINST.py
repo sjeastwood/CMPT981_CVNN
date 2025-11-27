@@ -1,5 +1,3 @@
-# %%
-# !git clone https://github.com/torchcvnn/examples
 
 # %%
 import numpy as np
@@ -16,7 +14,7 @@ import torchvision.transforms as T
 from tqdm import tqdm
 
 # %%
-# !pip install torchcvnn
+
 import torchcvnn.nn as c_nn
 
 # %%
@@ -81,6 +79,38 @@ class ComplexMnistCNN(nn.Module):
         return x.abs()
 
 # %%
+class RealMnistCNN(nn.Module):
+    def __init__(self, use_two_channels=False):
+        super().__init__()
+        in_ch = 2 if use_two_channels else 1
+
+        self.features = nn.Sequential(
+            nn.ConvTranspose2d(in_ch, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.ConvTranspose2d(16, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.AvgPool2d(kernel_size=2, stride=2),
+            nn.ConvTranspose2d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.AvgPool2d(kernel_size=2, stride=2),
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 7 * 7, 128),
+            nn.ReLU(),
+            nn.Linear(128, 10),
+        )
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.classifier(x)
+        return x
+
+# %%
 class ComplexFourierMNIST(torch.utils.data.Dataset):
     def __init__(self, mnist_dataset):
         self.base = mnist_dataset
@@ -122,6 +152,37 @@ def train_one_epoch(model, loader, optimizer, criterion, epoch, act_name):
     acc = correct / total
     print(f"[{act_name}] Epoch {epoch} | loss={avg_loss:.4f} | acc={acc:.4f}")
 
+# %%
+def real_train_one_epoch(real_model, loader, optimizer, criterion, epoch):
+    real_model.train()
+    total_loss, correct, total = 0.0, 0, 0
+
+    pbar = tqdm(loader, desc=f"[Real CNN Train {epoch}", leave=False)
+    for x, y in pbar:
+        xr = torch.view_as_real(x)            # [B,1,28,28,2]
+        xr = xr.squeeze(1)                    # [B,28,28,2]
+        xr = xr.permute(0, 3, 1, 2)           # [B,2,28,28]
+        xr = xr.float().to(device)
+
+        y = y.to(device)
+
+        
+        optimizer.zero_grad()
+
+        logits = real_model(xr)
+        loss = criterion(logits, y)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item() * x.size(0)
+        _, preds = logits.max(1)
+        correct += (preds == y).sum().item()
+        total += y.size(0)
+
+    avg_loss = total_loss / total
+    acc = correct / total
+    print(f"[Real CNN] Epoch {epoch} | loss={avg_loss:.4f} | acc={acc:.4f}")
+
 # %% [markdown]
 # Eval Loop
 
@@ -148,6 +209,34 @@ def evaluate(model, loader, criterion, act_name):
     print(f"[{act_name}] Val | loss={avg_loss:.4f} | acc={acc:.4f}")
     return avg_loss, acc
 
+# %%
+def real_evaluate(real_model, loader, criterion):
+    real_model.eval()
+    total_loss, correct, total = 0.0, 0, 0
+
+    with torch.no_grad():
+        pbar = tqdm(loader, desc=f"[Real CNN Eval", leave=False)
+        for x, y in pbar:
+            xr = torch.view_as_real(x)        # [B,1,28,28,2]
+            xr = xr.squeeze(1)                # [B,28,28,2]
+            xr = xr.permute(0, 3, 1, 2)       # [B,2,28,28]
+            xr = xr.float().to(device)
+
+            y = y.to(device)
+
+            logits = real_model(xr)
+            loss = criterion(logits, y)
+
+            total_loss += loss.item() * x.size(0)
+            _, preds = logits.max(1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+
+    avg_loss = total_loss / total
+    acc = correct / total
+    print(f"[Real CNN] | loss={avg_loss:.4f} | acc={acc:.4f}")
+    return avg_loss, acc
+
 # %% [markdown]
 # Main
 
@@ -166,6 +255,9 @@ test_ds  = ComplexFourierMNIST(test_real)
 train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=4, pin_memory=True)
 test_loader  = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=4, pin_memory=True)
 
+# %% [markdown]
+# CVNN
+
 # %%
 activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu", "c_sigmoid", "c_tanh", "c_elu", "c_gelu"]
 
@@ -181,15 +273,28 @@ for act_name in activations_to_test:
 
 
 # %%
-# print(dir(c_nn))
-
-# %%
 x0, y0 = next(iter(train_loader))
 print("dataset batch dtype:", x0.dtype, x0.shape)
 
 
 # %%
 print(dir(c_nn))
+
+# %%
+
+
+# %% [markdown]
+# Real NN
+
+# %%
+real_model = RealMnistCNN(use_two_channels=True).to(device)
+optimizer = optim.Adam(real_model.parameters(), lr=1e-3)
+criterion = nn.CrossEntropyLoss()
+
+for epoch in range(1, 6):
+    real_train_one_epoch(real_model, train_loader, optimizer, criterion, epoch )
+    real_evaluate(real_model, test_loader, criterion)
+
 
 # %%
 
