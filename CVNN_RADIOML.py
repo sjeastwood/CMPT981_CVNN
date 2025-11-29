@@ -202,17 +202,91 @@ def evaluate(model, loader, criterion, tag="Complex"):
     print(f"[{tag}] Val | loss={avg_loss:.4f} | acc={acc:.4f}")
     return avg_loss, acc
 
+
+def run_grid_search(learning_rates, activations, epochs=5):
+    grid_results = {}
+    activations = activations if isinstance(activations, list) else [activations]
+    learning_rates = learning_rates if isinstance(learning_rates, list) else [learning_rates]
+    for af in activations:
+        grid_results[af] = {}
+        
+        for lr in learning_rates:
+            run_metrics = {
+                "train_loss": [], "val_loss": [],
+                "train_acc": [], "val_acc": [],
+                "grad_norm": []
+            }
+
+            model = ComplexRadioCNN(n_classes=24, af=af).to(device)
+            optimizer = optim.Adam(model.parameters(), lr=lr)
+            criterion = nn.CrossEntropyLoss()
+            for epoch in range(1, epochs + 1):
+                
+                tag_str = f"{af}|lr={lr}"
+                
+                t_loss, t_acc, g_norm = train_one_epoch(model, train_loader, optimizer, criterion, epoch, tag=tag_str)
+                v_loss, v_acc = evaluate(model, test_loader, criterion, tag=tag_str)
+                
+                # Log metrics
+                run_metrics["train_loss"].append(t_loss)
+                run_metrics["train_acc"].append(t_acc)
+                run_metrics["grad_norm"].append(g_norm)
+                run_metrics["val_loss"].append(v_loss)
+                run_metrics["val_acc"].append(v_acc)
+                
+                print(f"\tEp {epoch}: TrainLoss={t_loss:.4f}, ValAcc={v_acc:.4f}, GradNorm={g_norm:.2f}")
+
+            # Store run
+            grid_results[af][lr] = run_metrics
+
+    return grid_results
+
+
+
 activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu", "c_sigmoid", "c_tanh"]
+learning_rates = [1e-2, 1e-3, 1e-4, 1e-5, 1e-6] # Grid search values
+num_epochs = 20
+
+grid_results = {}
 
 for af in activations_to_test:
-    print(f"\n=== Testing activation: {af} ===")
+    grid_results[af] = {}
+    print(f"\n==========================================")
+    print(f" Activation: {af}")
+    print(f"==========================================")
+    
+    for lr in learning_rates:
+        print(f"--> Grid: LR = {lr}")
+        
+        # 1. Initialize storage for this run
+        run_metrics = {
+            "train_loss": [], "val_loss": [],
+            "train_acc": [], "val_acc": [],
+            "grad_norm": []
+        }
+        
+        # 2. Re-Initialize Model & Optimizer (Crucial for Grid Search)
+        model = ComplexRadioCNN(n_classes=24, af=af).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        criterion = nn.CrossEntropyLoss()
 
-    model = ComplexRadioCNN(n_classes=24, af=af).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-5)
-    criterion = nn.CrossEntropyLoss()
+        # 3. Training Loop
+        for epoch in range(1, num_epochs + 1):
+            tag_str = f"{af}|lr={lr}"
+            
+            t_loss, t_acc, g_norm = train_one_epoch(model, train_loader, optimizer, criterion, epoch, tag=tag_str)
+            v_loss, v_acc = evaluate(model, test_loader, criterion, tag=tag_str)
+            
+            # Log metrics
+            run_metrics["train_loss"].append(t_loss)
+            run_metrics["train_acc"].append(t_acc)
+            run_metrics["grad_norm"].append(g_norm)
+            run_metrics["val_loss"].append(v_loss)
+            run_metrics["val_acc"].append(v_acc)
+            
+            print(f"    Ep {epoch}: TrainLoss={t_loss:.4f}, ValAcc={v_acc:.4f}, GradNorm={g_norm:.2f}")
 
-    for epoch in range(1, 6):
-        train_one_epoch(model, train_loader, optimizer, criterion, epoch, tag=af)
-        evaluate(model, test_loader, criterion, tag=af)
+        # Store run
+        grid_results[af][lr] = run_metrics
 
 
