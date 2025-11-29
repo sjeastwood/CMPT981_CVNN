@@ -245,7 +245,7 @@ def run_grid_search(learning_rates, activations, epochs=5):
 
 activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu", "c_sigmoid", "c_tanh"]
 learning_rates = [1e-2, 1e-3, 1e-4, 1e-5, 1e-6] # Grid search values
-num_epochs = 20
+num_epochs = 5
 
 grid_results = {}
 
