@@ -21,12 +21,6 @@ import complextorch.nn.modules.linear as CVLinear
 import complextorch.nn.modules.pooling as CVPooling
 import complextorch.nn.modules.activation as CVActivation
 import complextorch.nn.modules.batchnorm as CVBatchNorm
-from cplxmodule import cplx
-from cplxmodule.nn import CplxConv1d, CplxLinear, CplxModReLU
-
-# %%
-# !pip install torchcvnn
-import torchcvnn.nn as c_nn
 
 # %%
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -44,7 +38,7 @@ def get_complex_activation(name: str):
     elif name == "cardioid":
         return CVActivation.CVCardiod()
     elif name == "c_relu":
-        return CVActivation.CReLU()
+        return CVActivation.CReLU(inplace=False)
     elif name == "c_sigmoid":
         return CVActivation.CVSigmoid()
     elif name == "c_tanh":
@@ -53,16 +47,17 @@ def get_complex_activation(name: str):
         return nn.Identity()
 
 # %%
-activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu", "c_sigmoid", "c_tanh", "c_elu", "c_gelu"]
-
 data_loc = "/mnt/i/RADIOML/"
+
+# %%
+N = 200000
 
 # %%
 with h5py.File(data_loc + "GOLD_XYZ_OSC.0001_1024.hdf5", "r") as f:
     print(list(f.keys()))   
-    x = f["X"][:1000]
-    y = f["Y"][:1000]
-    z = f["Z"][:1000]
+    x = f["X"][:N]
+    y = f["Y"][:N]
+    z = f["Z"][:N]
     print(x.shape, y.shape, z.shape)
 
 
@@ -72,6 +67,9 @@ with h5py.File(data_loc + "GOLD_XYZ_OSC.0001_1024.hdf5", "r") as f:
 # Y is the labels, one-hot encoded so we have 24 labels, only 1 of them should have 1.
 # 
 # Z SNR - signal to noise ratio and each series has an associated value
+
+# %%
+z[0]
 
 # %%
 class ComplexRadioCNN(nn.Module):
@@ -109,16 +107,16 @@ class ComplexRadioCNN(nn.Module):
 
 # %%
 X = x.astype("float32")
-X_complex = X[..., 0] + 1j * X[..., 1]        # shape (N, 1024), complex64
-X_complex = torch.from_numpy(X_complex).to(torch.complex64)  # (N, 1024)
-X_complex = X_complex.unsqueeze(1)            # (N, 1, 1024) for Conv1d-style nets
+X_complex = X[..., 0] + 1j * X[..., 1]        
+X_complex = torch.from_numpy(X_complex).to(torch.complex64)  
+X_complex = X_complex.unsqueeze(1)            
+X_real = torch.from_numpy(X).permute(0, 2, 1).float()  
 
-X_real = torch.from_numpy(X).permute(0, 2, 1).float()  # (N, 2, 1024)
-Y_idx = y.argmax(axis=1)          # numpy, shape (N,)
+Y_idx = y.argmax(axis=1)         
 Y_idx = torch.from_numpy(Y_idx).long()
 
 # %%
-class RadioDataset(Dataset):
+class RadioComplexDataset(Dataset):
     def __init__(self, X_complex, Y_idx):
         self.X = X_complex   # [N,1,1024], complex
         self.y = Y_idx       # [N], long
@@ -130,13 +128,18 @@ class RadioDataset(Dataset):
         return self.X[i], self.y[i]
 
 # %%
-N = X_complex.shape[0]
-split = int(0.8 * N)
-train_ds = RadioDataset(X_complex[:split], Y_idx[:split])
-test_ds  = RadioDataset(X_complex[split:], Y_idx[split:])
+# N = X_real.shape[0]
+perm = torch.randperm(N)
 
-train_loader = DataLoader(train_ds, batch_size=128, shuffle=True,  num_workers=4, pin_memory=True)
-test_loader  = DataLoader(test_ds,  batch_size=256, shuffle=False, num_workers=4, pin_memory=True)
+X_real = X_real[perm]
+X_complex = X_complex[perm]
+Y_idx = Y_idx[perm]
+
+split = int(0.8 * N)
+cv_train_ds = RadioComplexDataset(X_complex[:split], Y_idx[:split])
+cv_test_ds  = RadioComplexDataset(X_complex[split:], Y_idx[split:])
+cv_train_loader = DataLoader(cv_train_ds, batch_size=256, shuffle=True,  num_workers=4, pin_memory=True)
+cv_test_loader  = DataLoader(cv_test_ds,  batch_size=256, shuffle=False, num_workers=4, pin_memory=True)
 
 # %%
 def train_one_epoch(model, loader, optimizer, criterion, epoch, tag="Complex"):
@@ -185,7 +188,14 @@ def evaluate(model, loader, criterion, tag="Complex"):
     return avg_loss, acc
 
 # %%
+print("X_real:", X_real.shape, X_real.dtype)       
+print("X_complex:", X_complex.shape, X_complex.dtype)  
+print("Y_idx:", Y_idx.shape, Y_idx.min(), Y_idx.max())  
+
+
+# %%
 activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu", "c_sigmoid", "c_tanh"]
+
 
 for af in activations_to_test:
     print(f"\n=== Testing activation: {af} ===")
@@ -196,19 +206,131 @@ for af in activations_to_test:
     criterion = nn.CrossEntropyLoss()
 
     for epoch in range(1, 6):
-        train_one_epoch(model, train_loader, optimizer, criterion, epoch, tag=af)
-        evaluate(model, test_loader, criterion, tag=af)
+        train_one_epoch(model, cv_train_loader, optimizer, criterion, epoch, tag=af)
+        evaluate(model, cv_test_loader, criterion, tag=af)
+
+
+
+# %% [markdown]
+# Real NN
+
+# %%
+class RadioRealDataset(Dataset):
+    def __init__(self, X_real, Y_idx):
+        self.X = X_real    # [N,2,1024], float32
+        self.y = Y_idx     # [N], long
+
+    def __len__(self):
+        return self.X.shape[0]
+
+    def __getitem__(self, i):
+        return self.X[i], self.y[i]
+
+real_train_ds = RadioRealDataset(X_real[:split], Y_idx[:split])
+real_test_ds  = RadioRealDataset(X_real[split:], Y_idx[split:])
+
+real_train_loader = DataLoader(
+    real_train_ds, batch_size=256, shuffle=True, num_workers=4, pin_memory=True
+)
+real_test_loader = DataLoader(
+    real_test_ds, batch_size=256, shuffle=False, num_workers=4, pin_memory=True
+)
+
+
+# %%
+class RealRadioCNN(nn.Module):
+    def __init__(self, n_classes=24):
+        super().__init__()
+        in_ch = 2  # I/Q channels
+
+        self.features = nn.Sequential(
+            nn.Conv1d(in_ch, 16, kernel_size=7, padding=3),
+            # nn.BatchNorm1d(16),
+            nn.ReLU(),
+
+            nn.Conv1d(16, 32, kernel_size=7, padding=3),
+            # nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(512),   # 1024 -> 512
+
+            nn.Conv1d(32, 64, kernel_size=7, padding=3),
+            # nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(256),   # 512 -> 256
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(64 * 256, 256),
+            nn.ReLU(),
+            nn.Linear(256, n_classes),
+        )
+
+    def forward(self, x):
+        # x: [B,2,1024], float
+        x = self.features(x)
+        x = self.classifier(x)
+        return x  # logits [B, n_classes]
+
+
+# %%
+def real_train_one_epoch(model, loader, optimizer, criterion, epoch, tag="Real"):
+    model.train()
+    total_loss, correct, total = 0.0, 0, 0
+
+    for x, y in tqdm(loader, desc=f"[{tag}] Train {epoch}", leave=False):
+        x = x.to(device)    # [B,2,1024], float
+        y = y.to(device)
+
+        optimizer.zero_grad()
+        logits = model(x)
+        loss = criterion(logits, y)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item() * x.size(0)
+        _, preds = logits.max(1)
+        correct += (preds == y).sum().item()
+        total += y.size(0)
+
+    avg_loss = total_loss / total
+    acc = correct / total
+    print(f"[{tag}] Epoch {epoch} | loss={avg_loss:.4f} | acc={acc:.4f}")
+
+
+def real_evaluate(model, loader, criterion, tag="Real"):
+    model.eval()
+    total_loss, correct, total = 0.0, 0, 0
+
+    with torch.no_grad():
+        for x, y in tqdm(loader, desc=f"[{tag}] Eval", leave=False):
+            x = x.to(device)
+            y = y.to(device)
+            logits = model(x)
+            loss = criterion(logits, y)
+
+            total_loss += loss.item() * x.size(0)
+            _, preds = logits.max(1)
+            correct += (preds == y).sum().item()
+            total += y.size(0)
+
+    avg_loss = total_loss / total
+    acc = correct / total
+    print(f"[{tag}] Val | loss={avg_loss:.4f} | acc={acc:.4f}")
+    return avg_loss, acc
+
+
+# %%
+real_model = RealRadioCNN(n_classes=24).to(device)
+real_optimizer = optim.Adam(real_model.parameters(), lr=1e-3)
+criterion = nn.CrossEntropyLoss()
+
+for epoch in range(1, 6):
+    real_train_one_epoch(real_model, real_train_loader, real_optimizer, criterion, epoch, tag="RealCNN")
+    real_evaluate(real_model, real_test_loader, criterion, tag="RealCNN")
+
 
 # %%
 # print([n for n in dir(CVPooling)])
-
-# %% [markdown]
-# ## CPLXModule
-
-# %%
-# !pip install cplxmodule
-
-# %%
-
 
 
