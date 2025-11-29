@@ -38,21 +38,17 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 def get_complex_activation(name: str):
     name = name.lower()
     if name == "modrelu":
-        return c_nn.modReLU()
+        return CVActivation.modReLU(bias=-0.1)
     elif name == "zrelu":
-        return c_nn.zReLU()
+        return CVActivation.zReLU()
     elif name == "cardioid":
-        return c_nn.Cardioid()
+        return CVActivation.CVCardiod()
     elif name == "c_relu":
-        return c_nn.CReLU()
+        return CVActivation.CReLU()
     elif name == "c_sigmoid":
-        return c_nn.CSigmoid()
+        return CVActivation.CVSigmoid()
     elif name == "c_tanh":
-        return c_nn.CTanh()
-    elif name == "c_elu":
-        return c_nn.CELU()
-    elif name == "c_gelu":
-        return c_nn.CGELU()
+        return CVActivation.CTanh()
     else:
         return nn.Identity()
 
@@ -79,26 +75,29 @@ with h5py.File(data_loc + "GOLD_XYZ_OSC.0001_1024.hdf5", "r") as f:
 
 # %%
 class ComplexRadioCNN(nn.Module):
-    def __init__(self, n_classes=24):
+    def __init__(self, n_classes=24, af="modrelu"):
         super().__init__()
+        cvaf = get_complex_activation(af)
+        
+        
         self.features = nn.Sequential(
             CVConv.Conv1d(1, 16, kernel_size=7, padding=3),
             # CVBatchNorm.BatchNorm1d(16),
-            CVActivation.modReLU(bias=-0.1),      # <-- set bias < 0
+            cvaf,
             CVConv.Conv1d(16, 32, kernel_size=7, padding=3),
             # CVBatchNorm.BatchNorm1d(32),
-            CVActivation.modReLU(bias=-0.1),
+            cvaf,
             CVPooling.AdaptiveAvgPool1d(512),   # 1024 -> 512
             CVConv.Conv1d(32, 64, kernel_size=7, padding=3),
             # CVBatchNorm.BatchNorm1d(64),
-            CVActivation.modReLU(bias=-0.1),
+            cvaf,
             CVPooling.AdaptiveAvgPool1d(256),   # 512 -> 256
         )
 
         self.classifier = nn.Sequential(
             nn.Flatten(),
             CVLinear.Linear(64 * 256, 256),
-            CVActivation.modReLU(bias=-0.1),
+            cvaf,
             CVLinear.Linear(256, n_classes),
         )
 
@@ -114,11 +113,7 @@ X_complex = X[..., 0] + 1j * X[..., 1]        # shape (N, 1024), complex64
 X_complex = torch.from_numpy(X_complex).to(torch.complex64)  # (N, 1024)
 X_complex = X_complex.unsqueeze(1)            # (N, 1, 1024) for Conv1d-style nets
 
-# %%
 X_real = torch.from_numpy(X).permute(0, 2, 1).float()  # (N, 2, 1024)
-
-
-# %%
 Y_idx = y.argmax(axis=1)          # numpy, shape (N,)
 Y_idx = torch.from_numpy(Y_idx).long()
 
@@ -139,8 +134,6 @@ N = X_complex.shape[0]
 split = int(0.8 * N)
 train_ds = RadioDataset(X_complex[:split], Y_idx[:split])
 test_ds  = RadioDataset(X_complex[split:], Y_idx[split:])
-
-# %%
 
 train_loader = DataLoader(train_ds, batch_size=128, shuffle=True,  num_workers=4, pin_memory=True)
 test_loader  = DataLoader(test_ds,  batch_size=256, shuffle=False, num_workers=4, pin_memory=True)
@@ -192,13 +185,19 @@ def evaluate(model, loader, criterion, tag="Complex"):
     return avg_loss, acc
 
 # %%
-model = ComplexRadioCNN(n_classes=24).to(device)
-optimizer = optim.Adam(model.parameters(), lr=1e-3)
-criterion = nn.CrossEntropyLoss()
+activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu", "c_sigmoid", "c_tanh"]
 
-for epoch in range(1, 6):
-    train_one_epoch(model, train_loader, optimizer, criterion, epoch, tag="CVNN")
-    evaluate(model, test_loader, criterion, tag="CVNN")
+for af in activations_to_test:
+    print(f"\n=== Testing activation: {af} ===")
+
+
+    model = ComplexRadioCNN(n_classes=24, af=af).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    criterion = nn.CrossEntropyLoss()
+
+    for epoch in range(1, 6):
+        train_one_epoch(model, train_loader, optimizer, criterion, epoch, tag=af)
+        evaluate(model, test_loader, criterion, tag=af)
 
 # %%
 # print([n for n in dir(CVPooling)])
