@@ -1,7 +1,4 @@
-# %%
-# !git clone https://github.com/torchcvnn/examples
-
-# %%
+import os, sys
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import norm
@@ -10,6 +7,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as T
 from tqdm import tqdm
@@ -22,19 +20,16 @@ import complextorch.nn.modules.pooling as CVPooling
 import complextorch.nn.modules.activation as CVActivation
 import complextorch.nn.modules.batchnorm as CVBatchNorm
 from cplxmodule import cplx
-from cplxmodule.nn import CplxConv1d, CplxLinear, CplxModReLU
+from cplxmodule.nn import CplxModReLU
 
-# %%
-# !pip install torchcvnn
 import torchcvnn.nn as c_nn
 
-# %%
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# %% [markdown]
-# Check torchcvnn.nn for names like ModReLU, zReLU, Cardioid, etc.
+class SafeCReLU(nn.Module):
+    def forward(self, z):
+        return torch.complex(F.relu(z.real), F.relu(z.imag))
 
-# %%
 def get_complex_activation(name: str):
     name = name.lower()
     if name == "modrelu":
@@ -44,7 +39,7 @@ def get_complex_activation(name: str):
     elif name == "cardioid":
         return CVActivation.CVCardiod()
     elif name == "c_relu":
-        return CVActivation.CReLU()
+        return SafeCReLU()
     elif name == "c_sigmoid":
         return CVActivation.CVSigmoid()
     elif name == "c_tanh":
@@ -52,28 +47,33 @@ def get_complex_activation(name: str):
     else:
         return nn.Identity()
 
-# %%
-activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu", "c_sigmoid", "c_tanh", "c_elu", "c_gelu"]
+def get_datasets_snr(snr=0):
+    data_path = os.path.join("data", "RadioML", "GOLD_XYZ_Subset.hdf5")
+    datasets = {}
+    with h5py.File(data_path, "r") as f:
+        if isinstance(snr, list):
+            if len(snr) == 0:
+                for z in range(-20, 32, 2):
+                    datasets[z] = {
+                        "X": f[f"X_SNR_{z}"][:],
+                        "Y": f[f"Y_SNR_{z}"][:],
+                        "Z": f[f"Z_SNR_{z}"][:],
+                    }
+            else:
+                for z in snr:
+                    datasets[z] = {
+                        "X": f[f"X_SNR_{z}"][:],
+                        "Y": f[f"Y_SNR_{z}"][:],
+                        "Z": f[f"Z_SNR_{z}"][:],
+                    }
+        elif isinstance(snr, int):
+            datasets[snr] = {
+                "X": f[f"X_SNR_{snr}"][:],
+                "Y": f[f"Y_SNR_{snr}"][:],
+                "Z": f[f"Z_SNR_{snr}"][:],
+            }
+    return datasets
 
-data_loc = "/mnt/i/RADIOML/"
-
-# %%
-with h5py.File(data_loc + "GOLD_XYZ_OSC.0001_1024.hdf5", "r") as f:
-    print(list(f.keys()))   
-    x = f["X"][:1000]
-    y = f["Y"][:1000]
-    z = f["Z"][:1000]
-    print(x.shape, y.shape, z.shape)
-
-
-# %% [markdown]
-# We have N frames, with 1024 time-series samples, and they are real and imaginuary, we have 2. so X will be N x 1024 x 2.
-# 
-# Y is the labels, one-hot encoded so we have 24 labels, only 1 of them should have 1.
-# 
-# Z SNR - signal to noise ratio and each series has an associated value
-
-# %%
 class ComplexRadioCNN(nn.Module):
     def __init__(self, n_classes=24, af="modrelu"):
         super().__init__()
@@ -105,9 +105,14 @@ class ComplexRadioCNN(nn.Module):
         z = self.features(z)
         z = self.classifier(z)
         return z.abs()
+    
 
+dataset = get_datasets_snr()
 
-# %%
+x = dataset[0]["X"]
+y = dataset[0]["Y"]
+z = dataset[0]["Z"]
+
 X = x.astype("float32")
 X_complex = X[..., 0] + 1j * X[..., 1]        # shape (N, 1024), complex64
 X_complex = torch.from_numpy(X_complex).to(torch.complex64)  # (N, 1024)
@@ -117,7 +122,6 @@ X_real = torch.from_numpy(X).permute(0, 2, 1).float()  # (N, 2, 1024)
 Y_idx = y.argmax(axis=1)          # numpy, shape (N,)
 Y_idx = torch.from_numpy(Y_idx).long()
 
-# %%
 class RadioDataset(Dataset):
     def __init__(self, X_complex, Y_idx):
         self.X = X_complex   # [N,1,1024], complex
@@ -129,7 +133,6 @@ class RadioDataset(Dataset):
     def __getitem__(self, i):
         return self.X[i], self.y[i]
 
-# %%
 N = X_complex.shape[0]
 split = int(0.8 * N)
 train_ds = RadioDataset(X_complex[:split], Y_idx[:split])
@@ -138,10 +141,18 @@ test_ds  = RadioDataset(X_complex[split:], Y_idx[split:])
 train_loader = DataLoader(train_ds, batch_size=128, shuffle=True,  num_workers=4, pin_memory=True)
 test_loader  = DataLoader(test_ds,  batch_size=256, shuffle=False, num_workers=4, pin_memory=True)
 
-# %%
+def get_grad_norm(model):
+    total_norm = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            param_norm = p.grad.detach().data.norm(2)
+            total_norm += param_norm.item() ** 2
+    return total_norm ** 0.5
+
 def train_one_epoch(model, loader, optimizer, criterion, epoch, tag="Complex"):
     model.train()
     total_loss, correct, total = 0.0, 0, 0
+    batch_grad_norms = []
 
     for x, y in tqdm(loader, desc=f"[{tag}] Train {epoch}", leave=False):
         x = x.to(device)      # complex
@@ -151,6 +162,10 @@ def train_one_epoch(model, loader, optimizer, criterion, epoch, tag="Complex"):
         logits = model(x)     # [B, n_classes], real
         loss = criterion(logits, y)
         loss.backward()
+
+        grad_norm = get_grad_norm(model)
+        batch_grad_norms.append(grad_norm)
+
         optimizer.step()
 
         total_loss += loss.item() * x.size(0)
@@ -160,9 +175,12 @@ def train_one_epoch(model, loader, optimizer, criterion, epoch, tag="Complex"):
 
     avg_loss = total_loss / total
     acc = correct / total
-    print(f"[{tag}] Epoch {epoch} | loss={avg_loss:.4f} | acc={acc:.4f}")
+    avg_grad_norm = np.mean(batch_grad_norms) if batch_grad_norms else 0.0
+    print(f"[{tag}] Epoch {epoch} | loss={avg_loss:.4f} | acc={acc:.4f} | avg_norm={avg_grad_norm:.4f}")
 
-# %%
+    return avg_loss, acc, avg_grad_norm
+
+
 def evaluate(model, loader, criterion, tag="Complex"):
     model.eval()
     total_loss, correct, total = 0.0, 0, 0
@@ -184,31 +202,17 @@ def evaluate(model, loader, criterion, tag="Complex"):
     print(f"[{tag}] Val | loss={avg_loss:.4f} | acc={acc:.4f}")
     return avg_loss, acc
 
-# %%
 activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu", "c_sigmoid", "c_tanh"]
 
 for af in activations_to_test:
     print(f"\n=== Testing activation: {af} ===")
 
-
     model = ComplexRadioCNN(n_classes=24, af=af).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = optim.Adam(model.parameters(), lr=1e-5)
     criterion = nn.CrossEntropyLoss()
 
     for epoch in range(1, 6):
         train_one_epoch(model, train_loader, optimizer, criterion, epoch, tag=af)
         evaluate(model, test_loader, criterion, tag=af)
-
-# %%
-# print([n for n in dir(CVPooling)])
-
-# %% [markdown]
-# ## CPLXModule
-
-# %%
-# !pip install cplxmodule
-
-# %%
-
 
 
