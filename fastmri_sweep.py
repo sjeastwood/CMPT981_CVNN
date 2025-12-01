@@ -156,8 +156,8 @@ val_path   = "/project/def-hamarneh/eastwood/CVNN/multicore_val/file_brain_AXT2_
 train_ds = SingleFastMRIDataset(train_path, accel=4, max_slices=2000)
 val_ds   = SingleFastMRIDataset(val_path,   accel=4, max_slices=500)
 
-cv_train_loader = DataLoader(train_ds, batch_size=4, shuffle=True, num_workers=4, pin_memory=True)
-cv_val_loader   = DataLoader(val_ds,   batch_size=4, shuffle=False, num_workers=4, pin_memory=True)
+cv_train_loader = DataLoader(train_ds, batch_size=12, shuffle=True, num_workers=4, pin_memory=True)
+cv_val_loader   = DataLoader(val_ds,   batch_size=12, shuffle=False, num_workers=4, pin_memory=True)
 
 x0, y0 = next(iter(cv_train_loader))
 print("X_complex batch:", x0.shape, x0.dtype)  # [B,1,H,W], complex
@@ -559,9 +559,9 @@ class SingleFastMRIDatasetReal(Dataset):
 train_ds_real = SingleFastMRIDatasetReal(train_path, accel=4, max_slices=2000)
 val_ds_real   = SingleFastMRIDatasetReal(val_path,   accel=4, max_slices=500)
 
-rv_train_loader = DataLoader(train_ds_real, batch_size=4, shuffle=True,
+rv_train_loader = DataLoader(train_ds_real, batch_size=12, shuffle=True,
                              num_workers=4, pin_memory=True)
-rv_val_loader   = DataLoader(val_ds_real,   batch_size=4, shuffle=False,
+rv_val_loader   = DataLoader(val_ds_real,   batch_size=12, shuffle=False,
                              num_workers=4, pin_memory=True)
 
 
