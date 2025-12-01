@@ -321,10 +321,10 @@ test_loader  = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=4,
 
 
 history = {}
-num_epochs = 5
+num_epochs = 50
 
-# activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu", "c_sigmoid", "c_tanh", "c_elu", "c_gelu"]
-activations_to_test = ["modrelu", "c_relu", "c_tanh"]
+activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu", "c_sigmoid", "c_tanh", "c_elu", "c_gelu"]
+# activations_to_test = ["modrelu", "c_relu", "c_tanh"]
 
 for act_name in activations_to_test:
     print(f"\n=== Training activation: {act_name} ===")
