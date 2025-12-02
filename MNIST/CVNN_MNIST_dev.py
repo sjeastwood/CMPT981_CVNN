@@ -251,7 +251,7 @@ def real_evaluate(real_model, loader, criterion):
     print(f"[Real CNN] | loss={avg_loss:.4f} | acc={acc:.4f}")
     return avg_loss, acc
 
-def plot_comparison(history):
+def plot_comparison(history, epochs, lr):
     sns.set_theme(style="whitegrid")
     
     # Define the 6 metrics to plot
@@ -267,20 +267,86 @@ def plot_comparison(history):
         for model_name, stats in history.items():
             if metric in stats:
                 # Plot data points with markers for clarity
-                ax.plot(stats[metric], label=model_name, linewidth=2, marker='o', markersize=3, alpha=0.8)
+                ax.plot(range(1, epochs+1), stats[metric], label=model_name, linewidth=2, marker='o', markersize=3, alpha=0.8)
         
         ax.set_title(titles[i], fontsize=12, fontweight='bold')
         ax.set_xlabel("Epochs")
+
+        if "loss" in metric or "grad_norm" in metric:
+            ax.set_yscale('log')
+            # Add grid for minor ticks for better readability on log scale
+            ax.grid(True, which="both", ls="-", alpha=0.2)
         
         # if "acc" in metric:
         #     ax.set_ylim(0, 1.05)
             
     axes[-1].legend(loc='upper left', bbox_to_anchor=(1.05, 1), borderaxespad=0.)
+    fig.suptitle(f"Comparisons under learning rate = {lr}")
 
     plt.tight_layout()
     plt.show()
     os.makedirs("figures", exist_ok=True)
-    plt.savefig("figures/mnist_comparison.png", bbox_inches='tight')
+    plt.savefig(f"figures/mnist_comparison_{lr}.png", bbox_inches='tight')
+
+
+def experiment_lr(lr, num_epochs, activations, train_loader, test_loader):
+    local_history = {}
+    print(f"\n{'='*20}\nRunning Experiment with LR = {lr}\n{'='*20}")
+
+    for act_name in activations:
+        model_key = f"{act_name} (lr={lr})"
+        print(f"--- Training {model_key} ---")
+        
+        local_history[model_key] = {
+            "train_loss": [], "train_acc": [], 
+            "val_loss": [], "val_acc": [], 
+            "grad_norm": [], "epoch_times": []
+        }
+        
+        model = ComplexMnistCNN(act_name=act_name).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        criterion = nn.CrossEntropyLoss()
+
+        for epoch in range(1, num_epochs + 1):
+            start = time.time()
+            t_loss, t_acc, g_norm = train_one_epoch(model, train_loader, optimizer, criterion, epoch, model_key)
+            v_loss, v_acc = evaluate(model, test_loader, criterion, model_key)
+            elapsed = time.time() - start
+            
+            local_history[model_key]["train_loss"].append(t_loss)
+            local_history[model_key]["train_acc"].append(t_acc)
+            local_history[model_key]["grad_norm"].append(g_norm)
+            local_history[model_key]["val_loss"].append(v_loss)
+            local_history[model_key]["val_acc"].append(v_acc)
+            local_history[model_key]["epoch_times"].append(elapsed)
+
+    model_key = f"Real CNN (lr={lr})"
+    print(f"--- Training {model_key} ---")
+    
+    local_history[model_key] = {
+        "train_loss": [], "train_acc": [], 
+        "val_loss": [], "val_acc": [], 
+        "grad_norm": [], "epoch_times": []
+    }
+
+    real_model = RealMnistCNN(use_two_channels=True).to(device)
+    optimizer = optim.Adam(real_model.parameters(), lr=lr)
+    criterion = nn.CrossEntropyLoss()
+
+    for epoch in range(1, num_epochs + 1):
+        start = time.time()
+        t_loss, t_acc, g_norm = real_train_one_epoch(real_model, train_loader, optimizer, criterion, epoch)
+        v_loss, v_acc = real_evaluate(real_model, test_loader, criterion)
+        elapsed = time.time() - start
+
+        local_history[model_key]["train_loss"].append(t_loss)
+        local_history[model_key]["train_acc"].append(t_acc)
+        local_history[model_key]["grad_norm"].append(g_norm)
+        local_history[model_key]["val_loss"].append(v_loss)
+        local_history[model_key]["val_acc"].append(v_acc)
+        local_history[model_key]["epoch_times"].append(elapsed)
+
+    return local_history
 
 
 transform = T.Compose([
@@ -320,79 +386,22 @@ test_loader  = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=4,
 # show_batch(train_loader)
 
 
-history = {}
-num_epochs = 50
 
-activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu", "c_sigmoid", "c_tanh", "c_elu", "c_gelu"]
-# activations_to_test = ["modrelu", "c_relu", "c_tanh"]
+num_epochs = 20
 
-for act_name in activations_to_test:
-    print(f"\n=== Training activation: {act_name} ===")
-    
-    history[act_name] = {
-        "train_loss": [], "train_acc": [], 
-        "val_loss": [], "val_acc": [], 
-        "grad_norm": [], "epoch_times": [] # <--- New List
-    }
-    
-    model = ComplexMnistCNN(act_name=act_name).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    criterion = nn.CrossEntropyLoss()
+# activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu", "c_sigmoid", "c_tanh", "c_elu", "c_gelu"]
+activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu", "c_tanh", "c_elu", "c_gelu"]
+# activations_to_test = ["c_elu", "c_gelu"]
+learning_rates = [1e-2, 3e-3, 1e-3, 3e-4, 1e-4]
+# learning_rates = [1e-2, 1e-3, 1e-4, 1e-5, 1e-6]
 
-    for epoch in range(1, num_epochs + 1):
-        # <--- Start Timer
-        start_time = time.time()
-        
-        t_loss, t_acc, g_norm = train_one_epoch(model, train_loader, optimizer, criterion, epoch, act_name)
-        v_loss, v_acc = evaluate(model, test_loader, criterion, act_name)
-        
-        # <--- End Timer
-        end_time = time.time()
-        elapsed = end_time - start_time
-        
-        # Store data
-        history[act_name]["train_loss"].append(t_loss)
-        history[act_name]["train_acc"].append(t_acc)
-        history[act_name]["grad_norm"].append(g_norm)
-        history[act_name]["val_loss"].append(v_loss)
-        history[act_name]["val_acc"].append(v_acc)
-        history[act_name]["epoch_times"].append(elapsed) # <--- Store Time
+for lr in learning_rates:
+    # Run experiment
+    lr_history = experiment_lr(lr, num_epochs, activations_to_test, train_loader, test_loader)
+    print("\nGenerating Comparison Graphs...")
+    plot_comparison(lr_history, num_epochs, str(lr))
 
-# --- 3. Train Real Model (Baseline) ---
-print(f"\n=== Training Real CNN Baseline ===")
-real_model_name = "Real CNN"
-history[real_model_name] = {
-    "train_loss": [], "train_acc": [], 
-    "val_loss": [], "val_acc": [], 
-    "grad_norm": [], "epoch_times": [] # <--- New List
-}
 
-real_model = RealMnistCNN(use_two_channels=True).to(device)
-optimizer = optim.Adam(real_model.parameters(), lr=1e-3)
-criterion = nn.CrossEntropyLoss()
-
-for epoch in range(1, num_epochs + 1):
-    # <--- Start Timer
-    start_time = time.time()
-    
-    t_loss, t_acc, g_norm = real_train_one_epoch(real_model, train_loader, optimizer, criterion, epoch)
-    v_loss, v_acc = real_evaluate(real_model, test_loader, criterion)
-    
-    # <--- End Timer
-    end_time = time.time()
-    elapsed = end_time - start_time
-    
-    # Store data
-    history[real_model_name]["train_loss"].append(t_loss)
-    history[real_model_name]["train_acc"].append(t_acc)
-    history[real_model_name]["grad_norm"].append(g_norm)
-    history[real_model_name]["val_loss"].append(v_loss)
-    history[real_model_name]["val_acc"].append(v_acc)
-    history[real_model_name]["epoch_times"].append(elapsed) # <--- Store Time
-
-# --- 4. Plot Everything ---
-print("\nGenerating Performance Graphs...")
-plot_comparison(history)
 
 
 
