@@ -17,8 +17,10 @@ import torch.nn.functional as F
 # ### Test loading
 
 # %%
-# path = "/mnt/i/mridata/brain_multicoil_train_batch_0/multicoil_train/file_brain_AXT2_200_2000057.h5"
 
+
+# %%
+# activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu", "c_sigmoid", "c_tanh", "c_elu", "c_gelu"]
 activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu"]
 
 # %%
@@ -40,6 +42,10 @@ def simple_mask(Ny, accel=4, device="cpu"):
     center = Ny // 2
     mask[center-4:center+4] = 1.0
     return mask
+
+
+# %% [markdown]
+# ### For bulk dataset in the folder
 
 # %%
 class FastMRIDataset(Dataset):
@@ -100,7 +106,6 @@ class SingleFastMRIDataset(Dataset):
         self.path = path
         self.accel = accel
 
-        # Just count slices in this file
         with h5py.File(self.path, "r") as f:
             num_slices = f["kspace"].shape[0]
 
@@ -114,32 +119,30 @@ class SingleFastMRIDataset(Dataset):
     def __getitem__(self, idx):
         s = self.slice_indices[idx]
         with h5py.File(self.path, "r") as f:
-            kspace = f["kspace"][s]   # [num_coils, Ny, Nx] or [Ny,Nx]
-            kspace = torch.from_numpy(kspace)      # complex64
+            kspace = f["kspace"][s]          # [num_coils, Ny, Nx] or [Ny,Nx]
+            kspace = torch.from_numpy(kspace)  # complex64
 
-        # ----- simple mask along phase-encode dim -----
         Ny, Nx = kspace.shape[-2], kspace.shape[-1]
         mask = simple_mask(Ny, accel=self.accel).to(kspace.device)
-        mask = mask[:, None]           # [Ny,1]
-        kspace_und = kspace * mask     # same shape as kspace
+        mask = mask[:, None]                # [Ny,1]
+        kspace_und = kspace * mask
 
-        # ----- go to image domain -----
+        # image domain
         img_full = torch.fft.ifft2(kspace, norm="ortho")      # complex
         img_und  = torch.fft.ifft2(kspace_und, norm="ortho")  # complex
 
-        # if multicoil: coil combine with RSS
-        if img_full.ndim == 3:  # [coils,Ny,Nx]
-            img_full_rss = rss_combine(img_full)  # [Ny,Nx], real
-            # simple coil-combined complex input (sum of coils)
-            img_und_comb = img_und.sum(dim=0)     # [Ny,Nx], complex
-        else:  # single-coil [Ny,Nx]
-            img_full_rss = img_full.abs()
-            img_und_comb = img_und
+        if img_full.ndim == 3:   # [coils,Ny,Nx]
+            # coil-combined complex ground truth (simple sum here)
+            img_full_comb = img_full.sum(dim=0)   # [Ny,Nx] complex
+            img_und_comb  = img_und.sum(dim=0)    # [Ny,Nx] complex
+        else:                    # [Ny,Nx]
+            img_full_comb = img_full
+            img_und_comb  = img_und
 
-        X_complex = img_und_comb.unsqueeze(0)   # [1,H,W], complex
-        Y_target  = img_full_rss.unsqueeze(0)   # [1,H,W], float
+        X_complex = img_und_comb.unsqueeze(0)   # [1,H,W] complex
+        Y_complex = img_full_comb.unsqueeze(0)  # [1,H,W] complex
 
-        return X_complex, Y_target
+        return X_complex, Y_complex
 
 
 # %%
@@ -156,8 +159,8 @@ val_path   = "/project/def-hamarneh/eastwood/CVNN/multicore_val/file_brain_AXT2_
 train_ds = SingleFastMRIDataset(train_path, accel=4, max_slices=2000)
 val_ds   = SingleFastMRIDataset(val_path,   accel=4, max_slices=500)
 
-cv_train_loader = DataLoader(train_ds, batch_size=12, shuffle=True, num_workers=4, pin_memory=True)
-cv_val_loader   = DataLoader(val_ds,   batch_size=12, shuffle=False, num_workers=4, pin_memory=True)
+cv_train_loader = DataLoader(train_ds, batch_size=16, shuffle=True, num_workers=4, pin_memory=True)
+cv_val_loader   = DataLoader(val_ds,   batch_size=16, shuffle=False, num_workers=4, pin_memory=True)
 
 x0, y0 = next(iter(cv_train_loader))
 print("X_complex batch:", x0.shape, x0.dtype)  # [B,1,H,W], complex
@@ -185,6 +188,15 @@ def get_complex_activation(name: str):
         return c_nn.CGELU()
     else:
         return nn.Identity()
+
+# %%
+def complex_mse(pred, target):
+
+    diff = pred - target
+
+    return (diff.real**2 + diff.imag**2).mean()
+
+
 
 # %%
 class ComplexMRIUNetSmall(nn.Module):
@@ -273,28 +285,45 @@ class ComplexMRIUNetSmall(nn.Module):
         return out
 
 # %%
+def clip_and_norm_log_mag(mag, clip_percent=99.9):
+    # log10 magnitude
+    logmag = np.log10(mag + 1e-12)
+    # clip high end to a percentile to avoid one super-bright DC dominating
+    hi = np.percentile(logmag, clip_percent)
+    lo = np.percentile(logmag, 1.0)
+    logmag = np.clip(logmag, lo, hi)
+    vmin, vmax = logmag.min(), logmag.max()
+    if vmax > vmin:
+        return (logmag - vmin) / (vmax - vmin)
+    else:
+        return np.zeros_like(logmag)
+
+
+# %%
 def visualize_reconstruction_scaled(model, val_loader, num_samples=3, tag="modrelu"):
     model.eval()
     with torch.no_grad():
         x, y = next(iter(val_loader))
-        x = x.to(device)      # [B,1,H,W] complex
-        y = y.to(device)      # [B,1,H,W] real
+        x = x.to(device)        # [B,1,H,W] complex
+        y = y.to(device)        # [B,1,H,W] complex
 
-        y_hat = model(x)      # [B,1,H,W] complex
+        y_hat = model(x)        # [B,1,H,W] complex
 
-        # Compute a global scaling factor: match mean magnitude
-        tgt_mean = y.mean().item()
-        pred_mean = y_hat.abs().mean().item()
+        # Magnitudes for scaling + display
+        y_mag     = y.abs()
+        y_hat_mag = y_hat.abs()
+
+        tgt_mean  = y_mag.mean().item()
+        pred_mean = y_hat_mag.mean().item()
         eps = 1e-8
         scale = pred_mean / (tgt_mean + eps)
-        print(f"Scaling target by factor ≈ {scale:.3e}")
+        print(f"Scaling target magnitude by factor ≈ {scale:.3e}")
 
-        # Scale target for visualization only
-        y_scaled = y * scale
+        y_mag_scaled = y_mag * scale  # [B,1,H,W] real
 
-        x_cpu = x.cpu()
-        y_cpu = y_scaled.cpu()
-        y_hat_cpu = y_hat.cpu()
+        x_cpu     = x.cpu()
+        y_mag_cpu = y_mag_scaled.cpu()
+        y_hat_cpu = y_hat_mag.cpu()
 
         def norm_img(img):
             vmin, vmax = img.min(), img.max()
@@ -303,16 +332,17 @@ def visualize_reconstruction_scaled(model, val_loader, num_samples=3, tag="modre
             else:
                 return np.zeros_like(img)
 
-        fig, axes = plt.subplots(num_samples, 3, figsize=(12, 4*num_samples))
+        # ----- Image-space visualization -----
+        fig_img, axes_img = plt.subplots(num_samples, 3, figsize=(12, 4*num_samples))
         if num_samples == 1:
-            axes = axes.reshape(1, -1)
+            axes_img = axes_img.reshape(1, -1)
 
         for i in range(num_samples):
             in_mag   = np.fft.fftshift(x_cpu[i,0].abs().numpy())
-            tgt_mag  = np.fft.fftshift(y_cpu[i,0].numpy())         # scaled target
-            pred_mag = np.fft.fftshift(y_hat_cpu[i,0].abs().numpy())
+            tgt_mag  = np.fft.fftshift(y_mag_cpu[i,0].numpy())
+            pred_mag = np.fft.fftshift(y_hat_cpu[i,0].numpy())
 
-            print(f"Sample {i}: in[{in_mag.min():.3e},{in_mag.max():.3e}] "
+            print(f"[Image] Sample {i}: in[{in_mag.min():.3e},{in_mag.max():.3e}] "
                   f"tgt_scaled[{tgt_mag.min():.3e},{tgt_mag.max():.3e}] "
                   f"pred[{pred_mag.min():.3e},{pred_mag.max():.3e}]")
 
@@ -320,23 +350,66 @@ def visualize_reconstruction_scaled(model, val_loader, num_samples=3, tag="modre
             tgt_disp  = norm_img(np.log1p(tgt_mag))
             pred_disp = norm_img(np.log1p(pred_mag))
 
-            axes[i,0].imshow(in_disp, cmap="gray")
-            axes[i,0].set_title("Input (fftshift, log)")
-            axes[i,0].axis("off")
+            axes_img[i,0].imshow(in_disp,  cmap="gray")
+            axes_img[i,0].set_title("Input (img, fftshift, log)")
+            axes_img[i,0].axis("off")
 
-            axes[i,1].imshow(tgt_disp, cmap="gray")
-            axes[i,1].set_title("Target×scale (fftshift, log)")
-            axes[i,1].axis("off")
+            axes_img[i,1].imshow(tgt_disp, cmap="gray")
+            axes_img[i,1].set_title("Target×scale (img, fftshift, log)")
+            axes_img[i,1].axis("off")
 
-            axes[i,2].imshow(pred_disp, cmap="gray")
-            axes[i,2].set_title("Prediction (fftshift, log)")
-            axes[i,2].axis("off")
+            axes_img[i,2].imshow(pred_disp, cmap="gray_r")
+            axes_img[i,2].set_title("Prediction (img, fftshift, log)")
+            axes_img[i,2].axis("off")
 
-        print("orig target mean/std:", y.mean().item(), y.std().item())
-        print("pred abs mean/std:", y_hat.abs().mean().item(), y_hat.abs().std().item())
+        print("orig target mag mean/std:", y_mag.mean().item(), y_mag.std().item())
+        print("pred mag mean/std:", y_hat_mag.mean().item(), y_hat_mag.std().item())
 
-        plt.suptitle(f"Reconstruction – {tag} (scaled target for viz)")
-        plt.tight_layout()
+        fig_img.suptitle(f"Reconstruction – {tag} (Image space)")
+        fig_img.tight_layout()
+        plt.show()
+
+        # ----- Fourier-space visualization -----
+        fig_k, axes_k = plt.subplots(num_samples, 3, figsize=(12, 4*num_samples))
+        if num_samples == 1:
+            axes_k = axes_k.reshape(1, -1)
+
+        for i in range(num_samples):
+            # Compute FFT of image-domain complex data
+            xin  = x_cpu[i,0].numpy()
+            ytgt = y[i,0].cpu().numpy()        # original complex target (unscaled)
+            yph  = y_hat[i,0].cpu().numpy()
+
+            k_in   = np.fft.fftshift(np.fft.fft2(xin, norm="ortho"))
+            k_tgt  = np.fft.fftshift(np.fft.fft2(ytgt, norm="ortho"))
+            k_pred = np.fft.fftshift(np.fft.fft2(yph, norm="ortho"))
+
+            k_in_mag   = np.abs(k_in)
+            k_tgt_mag  = np.abs(k_tgt)
+            k_pred_mag = np.abs(k_pred)
+
+            print(f"[K-space] Sample {i}: in[{k_in_mag.min():.3e},{k_in_mag.max():.3e}] "
+                  f"tgt[{k_tgt_mag.min():.3e},{k_tgt_mag.max():.3e}] "
+                  f"pred[{k_pred_mag.min():.3e},{k_pred_mag.max():.3e}]")
+
+            kin_disp   = clip_and_norm_log_mag(k_in_mag)
+            ktgt_disp  = clip_and_norm_log_mag(k_tgt_mag)
+            kpred_disp = clip_and_norm_log_mag(k_pred_mag)
+            
+            axes_k[i,0].imshow(kin_disp,   cmap="gray")
+            axes_k[i,0].set_title("Input (k-space, fftshift, log)")
+            axes_k[i,0].axis("off")
+
+            axes_k[i,1].imshow(ktgt_disp,  cmap="gray")
+            axes_k[i,1].set_title("Target (k-space, fftshift, log)")
+            axes_k[i,1].axis("off")
+
+            axes_k[i,2].imshow(kpred_disp, cmap="gray")
+            axes_k[i,2].set_title("Prediction (k-space, fftshift, log)")
+            axes_k[i,2].axis("off")
+
+        fig_k.suptitle(f"Reconstruction – {tag} (K-space)")
+        fig_k.tight_layout()
         plt.show()
 
 
@@ -347,11 +420,6 @@ def calculate_psnr(pred, target, max_val=1.0):
     if mse == 0:
         return float('inf')
     return 20 * np.log10(max_val / np.sqrt(mse))
-
-# %%
-def mag_mse(pred, target):
-    diff = pred.abs() - target
-    return (diff ** 2).mean()
 
 # %%
 def train_one_epoch(model, loader, optimizer, epoch, tag="cardioid", log_grad_norm=False):
@@ -365,7 +433,7 @@ def train_one_epoch(model, loader, optimizer, epoch, tag="cardioid", log_grad_no
 
         optimizer.zero_grad()
         y_hat = model(x)   # complex
-        loss = mag_mse(y_hat, y)
+        loss = complex_mse(y_hat, y)
         loss.backward()
 
         if log_grad_norm:
@@ -398,20 +466,12 @@ def evaluate(model, loader, tag="cardioid"):
             x = x.to(device)
             y = y.to(device)
             y_hat = model(x)
-            loss = mag_mse(y_hat, y)
+            loss = complex_mse(y_hat, y)
             total_loss += loss.item() * x.size(0)
             total += x.size(0)
     avg_loss = total_loss / total
     print(f"[{tag}] Val | loss={avg_loss:.6f}")
     return avg_loss
-
-# %%
-def complex_to_two_channels(x):
-    # x: [B,1,H,W] complex
-    xr = torch.view_as_real(x)        # [B,1,H,W,2]
-    xr = xr.squeeze(1).permute(0, 3, 1, 2)  # [B,2,H,W]
-    return xr.float()
-
 
 # %% [markdown]
 # ### LR Sweeping
@@ -458,7 +518,7 @@ def lr_sweep_for_activation(act_name, lrs, num_epochs=10):
 lrs = [1e-2, 1e-3, 1e-4, 1e-5]
 num_epochs = 60
 
-all_results = {}  # all_results[act_name][lr] = dict with curves
+all_results = {}  
 
 for act_name in activations_to_test:
     print(f"\n##### Sweeping LRs for activation: {act_name} #####")
@@ -468,16 +528,16 @@ for act_name in activations_to_test:
 
 # %%
 # Save
-torch.save(all_results, "cvnn_lr_sweep_results.pt")
+torch.save(all_results, "cvnn_lr_sweep_results_complex.pt")
 
-# Later, reload
+# Reload
 # all_results = torch.load("cvnn_lr_sweep_results.pt")
 
 
 # %%
 import csv
 
-def export_results_to_csv(all_results, path="cvnn_lr_sweep_results.csv"):
+def export_results_to_csv(all_results, path="cvnn_lr_sweep_results_complex.csv"):
     """
     all_results[act_name][lr] = {
         'train_loss': [epoch losses],
@@ -509,34 +569,8 @@ def export_results_to_csv(all_results, path="cvnn_lr_sweep_results.csv"):
 export_results_to_csv(all_results, "cvnn_lr_sweep_results.csv")
 
 
-# %%
-# def plot_val_loss_for_activation(all_results, act_name):
-#     plt.figure(figsize=(8,5))
-#     for lr, metrics in all_results[act_name].items():
-#         plt.plot(metrics["val_loss"], label=f"lr={lr}")
-#     plt.xlabel("Epoch")
-#     plt.ylabel("Val loss")
-#     plt.title(f"Val loss vs epoch – {act_name}")
-#     plt.legend()
-#     plt.grid(True)
-#     plt.show()
-
-# def plot_grad_norm_for_activation(all_results, act_name):
-#     plt.figure(figsize=(8,5))
-#     for lr, metrics in all_results[act_name].items():
-#         plt.plot(metrics["grad_norm"], label=f"lr={lr}")
-#     plt.xlabel("Epoch")
-#     plt.ylabel("Avg grad L2 norm per epoch")
-#     plt.title(f"Grad norm vs epoch – {act_name}")
-#     plt.legend()
-#     plt.grid(True)
-#     plt.show()
-
-# # %%
-# plot_val_loss_for_activation(all_results, "modrelu")
-# plot_grad_norm_for_activation(all_results, "modrelu")
-
-
+# %% [markdown]
+# # REAL NETWORK
 
 # %%
 class SingleFastMRIDatasetReal(Dataset):
@@ -547,12 +581,17 @@ class SingleFastMRIDatasetReal(Dataset):
         return len(self.inner)
 
     def __getitem__(self, idx):
-        X_complex, Y_target = self.inner[idx]      # X_complex: [1,H,W] complex
-        # Convert to 2-channel real: [2,H,W]
-        xr = torch.view_as_real(X_complex)        # [1,H,W,2]
-        xr = xr.squeeze(0).permute(2, 0, 1)       # [2,H,W]
-        X_real = xr.float()
-        return X_real, Y_target.float()
+        X_complex, Y_complex = self.inner[idx]    # both [1,H,W] complex
+
+        # Input: 2‑channel real [2,H,W]
+        Xr = torch.view_as_real(X_complex)        # [1,H,W,2]
+        Xr = Xr.squeeze(0).permute(2, 0, 1)       # [2,H,W]
+
+        # Target: 2‑channel real [2,H,W]
+        Yr = torch.view_as_real(Y_complex)        # [1,H,W,2]
+        Yr = Yr.squeeze(0).permute(2, 0, 1)       # [2,H,W]
+
+        return Xr.float(), Yr.float()
 
 
 # %%
@@ -580,7 +619,7 @@ class RealMRIUNetSmall(nn.Module):
             nn.BatchNorm2d(16),
             act,
         )
-        self.pool1 = nn.AvgPool2d(kernel_size=2, stride=2)
+        self.pool1 = nn.AvgPool2d(2, 2)
 
         self.enc2 = nn.Sequential(
             nn.Conv2d(16, 32, kernel_size=3, padding=1),
@@ -590,9 +629,8 @@ class RealMRIUNetSmall(nn.Module):
             nn.BatchNorm2d(32),
             act,
         )
-        self.pool2 = nn.AvgPool2d(kernel_size=2, stride=2)
+        self.pool2 = nn.AvgPool2d(2, 2)
 
-        # Bottleneck
         self.bottleneck = nn.Sequential(
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
@@ -602,11 +640,7 @@ class RealMRIUNetSmall(nn.Module):
             act,
         )
 
-        # Decoder level 2 (H/4 → H/2)
-        self.up2 = nn.ConvTranspose2d(
-            64, 32, kernel_size=3, stride=2, padding=1, output_padding=1
-        )
-        # after concat: 32 (up) + 32 (enc2) = 64
+        self.up2 = nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1)
         self.dec2 = nn.Sequential(
             nn.Conv2d(64, 32, kernel_size=3, padding=1),
             nn.BatchNorm2d(32),
@@ -616,11 +650,7 @@ class RealMRIUNetSmall(nn.Module):
             act,
         )
 
-        # Decoder level 1 (H/2 → H)
-        self.up1 = nn.ConvTranspose2d(
-            32, 16, kernel_size=3, stride=2, padding=1, output_padding=1
-        )
-        # after concat: 16 (up) + 16 (enc1) = 32
+        self.up1 = nn.ConvTranspose2d(32, 16, kernel_size=3, stride=2, padding=1, output_padding=1)
         self.dec1 = nn.Sequential(
             nn.Conv2d(32, 16, kernel_size=3, padding=1),
             nn.BatchNorm2d(16),
@@ -630,7 +660,7 @@ class RealMRIUNetSmall(nn.Module):
             act,
         )
 
-        self.out_conv = nn.Conv2d(16, 1, kernel_size=3, padding=1)
+        self.out_conv = nn.Conv2d(16, 2, kernel_size=3, padding=1)  # 2 channels: Re, Im
 
     def forward(self, x):
         e1 = self.enc1(x)
@@ -642,14 +672,14 @@ class RealMRIUNetSmall(nn.Module):
         b = self.bottleneck(p2)
 
         u2 = self.up2(b)
-        u2 = torch.cat([u2, e2], dim=1)  # [B,64,H/2,W/2]
-        d2 = self.dec2(u2)               # [B,32,H/2,W/2]
+        u2 = torch.cat([u2, e2], dim=1)
+        d2 = self.dec2(u2)
 
         u1 = self.up1(d2)
-        u1 = torch.cat([u1, e1], dim=1)  # [B,32,H,W]
-        d1 = self.dec1(u1)               # [B,16,H,W]
+        u1 = torch.cat([u1, e1], dim=1)
+        d1 = self.dec1(u1)
 
-        out = self.out_conv(d1)          # [B,1,H,W]
+        out = self.out_conv(d1)   # [B,2,H,W]
         return out
 
 
@@ -658,13 +688,13 @@ def visualize_reconstruction_scaled_real(model, val_loader, num_samples=3, tag="
     model.eval()
     with torch.no_grad():
         x, y = next(iter(val_loader))
-        x = x.to(device)      # [B,2,H,W] float
-        y = y.to(device)      # [B,1,H,W] float
+        x = x.to(device)      # [B,2,H,W] float  (Re, Im)
+        y = y.to(device)      # [B,2,H,W] float  (Re, Im)
 
-        y_hat = model(x)      # [B,1,H,W] float
+        y_hat = model(x)      # [B,2,H,W] float
 
-        x_cpu = x.cpu()
-        y_cpu = y.cpu()
+        x_cpu     = x.cpu()
+        y_cpu     = y.cpu()
         y_hat_cpu = y_hat.cpu()
 
         def norm_img(img):
@@ -679,15 +709,20 @@ def visualize_reconstruction_scaled_real(model, val_loader, num_samples=3, tag="
             axes = axes.reshape(1, -1)
 
         for i in range(num_samples):
-            in_mag   = np.fft.fftshift(np.abs(x_cpu[i,0].numpy()))
-            tgt_mag  = np.fft.fftshift(y_cpu[i,0].numpy())
-            pred_mag = np.fft.fftshift(y_hat_cpu[i,0].numpy())
+            # Reconstruct complex images from 2 channels
+            x_complex     = x_cpu[i,0].numpy() + 1j * x_cpu[i,1].numpy()
+            y_complex     = y_cpu[i,0].numpy() + 1j * y_cpu[i,1].numpy()
+            y_hat_complex = y_hat_cpu[i,0].numpy() + 1j * y_hat_cpu[i,1].numpy()
+
+            in_mag   = np.fft.fftshift(np.abs(x_complex))
+            tgt_mag  = np.fft.fftshift(np.abs(y_complex))
+            pred_mag = np.fft.fftshift(np.abs(y_hat_complex))
 
             print(f"Sample {i}: in[{in_mag.min():.3e},{in_mag.max():.3e}] "
                   f"tgt[{tgt_mag.min():.3e},{tgt_mag.max():.3e}] "
                   f"pred[{pred_mag.min():.3e},{pred_mag.max():.3e}]")
 
-            # Optional: boost target for visualization only
+            # Optional: boost target magnitude for visualization only
             tgt_boost = tgt_mag * 1e3  # adjust factor if needed
 
             in_disp   = norm_img(np.log1p(in_mag))
@@ -706,8 +741,11 @@ def visualize_reconstruction_scaled_real(model, val_loader, num_samples=3, tag="
             axes[i,2].set_title("Prediction (fftshift, log)")
             axes[i,2].axis("off")
 
-        print("orig target mean/std:", y.mean().item(), y.std().item())
-        print("pred mean/std:", y_hat.mean().item(), y_hat.std().item())
+        # Stats on complex magnitudes
+        y_mag     = torch.sqrt(y[:,0]**2 + y[:,1]**2)
+        y_hat_mag = torch.sqrt(y_hat[:,0]**2 + y_hat[:,1]**2)
+        print("orig target mag mean/std:", y_mag.mean().item(), y_mag.std().item())
+        print("pred mag mean/std:", y_hat_mag.mean().item(), y_hat_mag.std().item())
 
         plt.suptitle(f"Reconstruction – {tag}")
         plt.tight_layout()
@@ -715,9 +753,8 @@ def visualize_reconstruction_scaled_real(model, val_loader, num_samples=3, tag="
 
 
 # %%
-def real_mse(pred, target):
-    # both [B,1,H,W] real
-    # if shapes ever differ (they shouldn't with this U-Net), you can interpolate target
+def real_complex_mse(pred, target):
+
     diff = pred - target
     return (diff ** 2).mean()
 
@@ -734,7 +771,7 @@ def train_one_epoch_real(model, loader, optimizer, epoch, tag="Real", log_grad_n
 
         optimizer.zero_grad()
         y_hat = model(x)   # [B,1,H,W] float
-        loss = real_mse(y_hat, y)
+        loss = real_complex_mse(y_hat, y)
         loss.backward()
 
         if log_grad_norm:
@@ -765,25 +802,14 @@ def evaluate_real(model, loader, tag="Real"):
             x = x.to(device)
             y = y.to(device)
             y_hat = model(x)
-            loss = real_mse(y_hat, y)
+            loss = real_complex_mse(y_hat, y)
             total_loss += loss.item() * x.size(0)
             total += x.size(0)
     avg_loss = total_loss / total
     print(f"[{tag}] Val | loss={avg_loss:.6f}")
     return avg_loss
 
-
 # %%
-# real_model = RealMRIUNetSmall().to(device)
-# optimizer_real = optim.Adam(real_model.parameters(), lr=1e-3)
-
-# for epoch in range(0, 60):
-#     train_one_epoch_real(real_model, rv_train_loader, optimizer_real, epoch, tag="RealUNet")
-#     evaluate_real(real_model, rv_val_loader, tag="RealUNet")
-
-
-# visualize_reconstruction_scaled_real(real_model, rv_val_loader, num_samples=3, tag="RealUNet")
-
 def run_real_unet_experiment(num_epochs=60, lr=1e-3, tag="RealUNet"):
     model = RealMRIUNetSmall().to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -810,18 +836,15 @@ def run_real_unet_experiment(num_epochs=60, lr=1e-3, tag="RealUNet"):
         "train_loss": train_losses,
         "val_loss": val_losses,
         "grad_norm": grad_norms_epoch,
-        "lr": lr,
     }
     return results
 
-real_results = run_real_unet_experiment(num_epochs=60, lr=1e-3, tag="RealUNet")
-# visualize_reconstruction_scaled_real(real_results["model"], rv_val_loader, num_samples=3, tag="RealUNet")
+# %%
+real_results = {}
 
-# Optionally save for later comparison
-torch.save(real_results, "real_unet_results.pt")
+for lr in [1e-2, 1e-3, 1e-4, 1e-5]:
+    real_results[lr] = run_real_unet_experiment(num_epochs=60, lr=lr, tag="RealUNet")
 
 
 # %%
-
-
-
+torch.save(real_results, f"real_unet_results_complex.pt")
