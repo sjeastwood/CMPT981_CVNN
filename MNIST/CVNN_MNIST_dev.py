@@ -349,9 +349,127 @@ def experiment_lr(lr, num_epochs, activations, train_loader, test_loader):
     return local_history
 
 
+    history = {}
+    
+    print(f"\n{'='*60}")
+    print(f"COMPARATIVE GRID SEARCH: {target_act} vs Real CNN")
+    print(f"Testing LRs: {lr_list}")
+    print(f"{'='*60}")
+
+    for lr in lr_list:
+        complex_key = f"{target_act} (lr={lr})"
+        print(f"   Training {complex_key}...")
+        
+        history[complex_key] = {
+            "train_loss": [], "train_acc": [], 
+            "val_loss": [], "val_acc": [], 
+            "grad_norm": [], "epoch_times": []
+        }
+        
+        c_model = ComplexMnistCNN(act_name=target_act).to(device)
+        c_opt = optim.Adam(c_model.parameters(), lr=lr)
+        criterion = nn.CrossEntropyLoss()
+
+        for epoch in range(1, num_epochs + 1):
+            start = time.time()
+            tl, ta, gn = train_one_epoch(c_model, train_loader, c_opt, criterion, epoch, complex_key)
+            vl, va = evaluate(c_model, test_loader, criterion, complex_key)
+            elapsed = time.time() - start
+            
+            history[complex_key]["train_loss"].append(tl)
+            history[complex_key]["train_acc"].append(ta)
+            history[complex_key]["grad_norm"].append(gn)
+            history[complex_key]["val_loss"].append(vl)
+            history[complex_key]["val_acc"].append(va)
+            history[complex_key]["epoch_times"].append(elapsed)
+
+        # --- B. Train Real Baseline ---
+        real_key = f"Real CNN (lr={lr})"
+        print(f"   Training {real_key}...")
+
+        history[real_key] = {
+            "train_loss": [], "train_acc": [], 
+            "val_loss": [], "val_acc": [], 
+            "grad_norm": [], "epoch_times": []
+        }
+
+        r_model = RealMnistCNN(use_two_channels=True).to(device)
+        r_opt = optim.Adam(r_model.parameters(), lr=lr)
+        
+        for epoch in range(1, num_epochs + 1):
+            start = time.time()
+            tl, ta, gn = real_train_one_epoch(r_model, train_loader, r_opt, criterion, epoch)
+            vl, va = real_evaluate(r_model, test_loader, criterion)
+            elapsed = time.time() - start
+
+            history[real_key]["train_loss"].append(tl)
+            history[real_key]["train_acc"].append(ta)
+            history[real_key]["grad_norm"].append(gn)
+            history[real_key]["val_loss"].append(vl)
+            history[real_key]["val_acc"].append(va)
+            history[real_key]["epoch_times"].append(elapsed)
+
+    return history
+
+def visualize_single_sample(real_ds, complex_ds, idx=0):
+    # 1. Get Samples
+    real_img, real_label = real_ds[idx]       # Shape: [1, 28, 28]
+    comp_img, comp_label = complex_ds[idx]    # Shape: [1, 28, 28] (Complex64)
+
+    # 2. Process Real Image
+    # Remove channel dim for plotting: [28, 28]
+    real_plot = real_img.squeeze().numpy()
+
+    # 3. Process Complex Image (Frequency Domain)
+    # We use fftshift to move the low frequencies (DC component) to the center of the image
+    comp_shifted = torch.fft.fftshift(comp_img.squeeze())
+    
+    # A. Magnitude Spectrum (Log scale is standard because DC component is massive)
+    magnitude = comp_shifted.abs()
+    log_magnitude = torch.log(1 + magnitude).numpy()
+    
+    # B. Phase Spectrum
+    phase = comp_shifted.angle().numpy()
+    
+    # C. Reconstructed (Inverse FFT check)
+    # We reverse the FFT to see if it looks like the original
+    reconstructed = torch.fft.ifft2(comp_img).real.squeeze().numpy()
+
+    # 4. Plotting
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+    
+    # Plot 1: Original Real Input
+    im1 = axes[0].imshow(real_plot, cmap='gray')
+    axes[0].set_title(f"Real Spatial Input\nLabel: {real_label}")
+    axes[0].axis('off')
+    plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+
+    # Plot 2: Frequency Magnitude (Log Scale)
+    im2 = axes[1].imshow(log_magnitude, cmap='inferno')
+    axes[1].set_title("Frequency Magnitude\n(Log Scale, Shifted)")
+    axes[1].axis('off')
+    plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+
+    # Plot 3: Frequency Phase
+    im3 = axes[2].imshow(phase, cmap='twilight') # Twilight is good for cyclic phase (-pi to pi)
+    axes[2].set_title("Frequency Phase\n(-pi to pi)")
+    axes[2].axis('off')
+    plt.colorbar(im3, ax=axes[2], fraction=0.046, pad=0.04)
+
+    # Plot 4: Inverse FFT (Sanity Check)
+    im4 = axes[3].imshow(reconstructed, cmap='gray')
+    axes[3].set_title("Inverse FFT\n(Reconstructed)")
+    axes[3].axis('off')
+    plt.colorbar(im4, ax=axes[3], fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    plt.savefig(f"figures/mnist_sample_visualization_idx{idx}.png", bbox_inches='tight')
+
+
+
 transform = T.Compose([
     T.ToTensor(),
-    AddGaussianNoise(0., 0.2),    # <--- NEW: Add Gaussian Noise (mean=0, std=0.2)
+    AddGaussianNoise(0., 0.5),    # <--- NEW: Add Gaussian Noise (mean=0, std=0.2)
     T.Lambda(lambda x: torch.clamp(x, 0, 1)),  # [0,1] float, shape [1,28,28]
 ])
 
@@ -387,12 +505,18 @@ test_loader  = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=4,
 
 
 
-num_epochs = 20
+# --- Execute Visualization ---
+# Assuming 'train_real' and 'train_ds' are defined from your previous code
+print("Visualizing Sample Index 0...")
+visualize_single_sample(train_real, train_ds, idx=0)
+
+
+num_epochs = 50
 
 # activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu", "c_sigmoid", "c_tanh", "c_elu", "c_gelu"]
-activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu", "c_tanh", "c_elu", "c_gelu"]
+activations_to_test = ["cardioid", "c_relu", "c_elu", "c_gelu"]
 # activations_to_test = ["c_elu", "c_gelu"]
-learning_rates = [1e-2, 3e-3, 1e-3, 3e-4, 1e-4]
+learning_rates = [3e-3, 1e-3, 3e-4]
 # learning_rates = [1e-2, 1e-3, 1e-4, 1e-5, 1e-6]
 
 for lr in learning_rates:
@@ -400,6 +524,8 @@ for lr in learning_rates:
     lr_history = experiment_lr(lr, num_epochs, activations_to_test, train_loader, test_loader)
     print("\nGenerating Comparison Graphs...")
     plot_comparison(lr_history, num_epochs, str(lr))
+
+
 
 
 
