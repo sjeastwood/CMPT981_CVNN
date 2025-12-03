@@ -21,7 +21,7 @@ import torch.nn.functional as F
 
 # %%
 # activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu", "c_sigmoid", "c_tanh", "c_elu", "c_gelu"]
-activations_to_test = ["modrelu", "zrelu", "cardioid", "c_relu"]
+activations_to_test = ["zrelu", "cardioid", "c_relu"]
 
 # %%
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -70,31 +70,27 @@ class FastMRIDataset(Dataset):
     def __getitem__(self, idx):
         path, s = self.samples[idx]
         with h5py.File(path, "r") as f:
-            kspace = f["kspace"][s]  # [num_coils, Ny, Nx], complex64
-            kspace = torch.from_numpy(kspace)      # complex64
+            kspace = f["kspace"][s]           # [num_coils, Ny, Nx], complex64
+            kspace = torch.from_numpy(kspace)  # complex64
 
-            # simple 1D undersampling mask along phase-encode (Ny)
             Ny, Nx = kspace.shape[-2], kspace.shape[-1]
             mask = simple_mask(Ny, accel=self.accel).to(kspace.device)
-            mask = mask[:, None]                 # [Ny,1], broadcast over Nx
-            kspace_und = kspace * mask          # [coils, Ny, Nx]
+            mask = mask[:, None]             # [Ny,1]
+            kspace_und = kspace * mask       # [coils,Ny,Nx]
 
         # IFFT2 coil-wise: k-space -> image domain
-        img_full_mc = torch.fft.ifft2(kspace, norm="ortho")      # [coils,Ny,Nx]
-        img_und_mc  = torch.fft.ifft2(kspace_und, norm="ortho")  # [coils,Ny,Nx]
+        img_full_mc = torch.fft.ifft2(kspace, norm="ortho")      # [coils,Ny,Nx] complex
+        img_und_mc  = torch.fft.ifft2(kspace_und, norm="ortho")  # [coils,Ny,Nx] complex
 
-        # Coil combine: RSS magnitude image as target (Y)
-        img_full_rss = rss_combine(img_full_mc)   # [Ny,Nx], real
+        # Coil-combined complex ground truth and input (simple sum over coils)
+        img_full_comb = img_full_mc.sum(dim=0)   # [Ny,Nx] complex
+        img_und_comb  = img_und_mc.sum(dim=0)    # [Ny,Nx] complex
 
-        # For complex model input, you can either:
-        # A) use coil-combined complex input (e.g., sum of coils)
-        img_und_comb = img_und_mc.sum(dim=0)      # [Ny,Nx], complex
+        X_complex = img_und_comb.unsqueeze(0)    # [1,H,W] complex
+        Y_complex = img_full_comb.unsqueeze(0)   # [1,H,W] complex
 
-        # add channel dim for Conv2d / complex Conv2d: [1,H,W]
-        X_complex = img_und_comb.unsqueeze(0)     # complex [1,H,W]
-        Y_target = img_full_rss.unsqueeze(0)      # real [1,H,W]
+        return X_complex, Y_complex
 
-        return X_complex, Y_target
 
 
 # %% [markdown]
@@ -149,18 +145,24 @@ class SingleFastMRIDataset(Dataset):
 # train_file = sorted(glob("multicoil_train/file_brain_*.h5"))
 # val_file   = sorted(glob("multicoil_val/file_brain_*.h5"))  
 
-# train_ds = FastMRIDataset(train_files, accel=4, max_slices=2000)
-# val_ds   = FastMRIDataset(val_files,   accel=4, max_slices=500)
+train_path = "/project/def-hamarneh/eastwood/CVNN/multicore_train/"
+val_path   = "/project/def-hamarneh/eastwood/CVNN/multicore_val/"
+
+train_files = sorted(glob.glob(train_path + "*.h5"))
+val_files   = sorted(glob.glob(val_path + "*.h5"))
+
+train_ds = FastMRIDataset(train_files, accel=4, max_slices=2000)
+val_ds   = FastMRIDataset(val_files,   accel=4, max_slices=500)
 
 
-train_path = "/project/def-hamarneh/eastwood/CVNN/multicore_train/file_brain_AXT2_200_2000057.h5"
-val_path   = "/project/def-hamarneh/eastwood/CVNN/multicore_val/file_brain_AXT2_200_2000022.h5"
+# train_path = "/project/def-hamarneh/eastwood/CVNN/multicore_train/file_brain_AXT2_200_2000057.h5"
+# val_path   = "/project/def-hamarneh/eastwood/CVNN/multicore_val/file_brain_AXT2_200_2000022.h5"
 
-train_ds = SingleFastMRIDataset(train_path, accel=4, max_slices=2000)
-val_ds   = SingleFastMRIDataset(val_path,   accel=4, max_slices=500)
+# train_ds = SingleFastMRIDataset(train_path, accel=4, max_slices=2000)
+# val_ds   = SingleFastMRIDataset(val_path,   accel=4, max_slices=500)
 
-cv_train_loader = DataLoader(train_ds, batch_size=16, shuffle=True, num_workers=4, pin_memory=True)
-cv_val_loader   = DataLoader(val_ds,   batch_size=16, shuffle=False, num_workers=4, pin_memory=True)
+cv_train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=4, pin_memory=True)
+cv_val_loader   = DataLoader(val_ds,   batch_size=64, shuffle=False, num_workers=4, pin_memory=True)
 
 x0, y0 = next(iter(cv_train_loader))
 print("X_complex batch:", x0.shape, x0.dtype)  # [B,1,H,W], complex
@@ -595,13 +597,13 @@ class SingleFastMRIDatasetReal(Dataset):
 
 
 # %%
-train_ds_real = SingleFastMRIDatasetReal(train_path, accel=4, max_slices=2000)
-val_ds_real   = SingleFastMRIDatasetReal(val_path,   accel=4, max_slices=500)
+# train_ds_real = SingleFastMRIDatasetReal(train_path, accel=4, max_slices=2000)
+# val_ds_real   = SingleFastMRIDatasetReal(val_path,   accel=4, max_slices=500)
 
-rv_train_loader = DataLoader(train_ds_real, batch_size=12, shuffle=True,
-                             num_workers=4, pin_memory=True)
-rv_val_loader   = DataLoader(val_ds_real,   batch_size=12, shuffle=False,
-                             num_workers=4, pin_memory=True)
+# rv_train_loader = DataLoader(train_ds_real, batch_size=12, shuffle=True,
+#                              num_workers=4, pin_memory=True)
+# rv_val_loader   = DataLoader(val_ds_real,   batch_size=12, shuffle=False,
+#                              num_workers=4, pin_memory=True)
 
 
 # %%
@@ -810,41 +812,41 @@ def evaluate_real(model, loader, tag="Real"):
     return avg_loss
 
 # %%
-def run_real_unet_experiment(num_epochs=60, lr=1e-3, tag="RealUNet"):
-    model = RealMRIUNetSmall().to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+# def run_real_unet_experiment(num_epochs=60, lr=1e-3, tag="RealUNet"):
+#     model = RealMRIUNetSmall().to(device)
+#     optimizer = optim.Adam(model.parameters(), lr=lr)
 
-    train_losses = []
-    val_losses = []
-    grad_norms_epoch = []
+#     train_losses = []
+#     val_losses = []
+#     grad_norms_epoch = []
 
-    for epoch in range(1, num_epochs + 1):
-        train_loss, grad_norms_batch = train_one_epoch_real(
-            model, rv_train_loader, optimizer, epoch, tag=tag, log_grad_norm=True
-        )
-        val_loss = evaluate_real(model, rv_val_loader, tag=tag)
+#     for epoch in range(1, num_epochs + 1):
+#         train_loss, grad_norms_batch = train_one_epoch_real(
+#             model, rv_train_loader, optimizer, epoch, tag=tag, log_grad_norm=True
+#         )
+#         val_loss = evaluate_real(model, rv_val_loader, tag=tag)
 
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        if grad_norms_batch:
-            grad_norms_epoch.append(sum(grad_norms_batch) / len(grad_norms_batch))
-        else:
-            grad_norms_epoch.append(0.0)
+#         train_losses.append(train_loss)
+#         val_losses.append(val_loss)
+#         if grad_norms_batch:
+#             grad_norms_epoch.append(sum(grad_norms_batch) / len(grad_norms_batch))
+#         else:
+#             grad_norms_epoch.append(0.0)
 
-    results = {
-        "model": model,
-        "train_loss": train_losses,
-        "val_loss": val_losses,
-        "grad_norm": grad_norms_epoch,
-    }
-    return results
+#     results = {
+#         "model": model,
+#         "train_loss": train_losses,
+#         "val_loss": val_losses,
+#         "grad_norm": grad_norms_epoch,
+#     }
+#     return results
 
-# %%
-real_results = {}
+# # %%
+# real_results = {}
 
-for lr in [1e-2, 1e-3, 1e-4, 1e-5]:
-    real_results[lr] = run_real_unet_experiment(num_epochs=60, lr=lr, tag="RealUNet")
+# for lr in [1e-2, 1e-3, 1e-4, 1e-5]:
+#     real_results[lr] = run_real_unet_experiment(num_epochs=60, lr=lr, tag="RealUNet")
 
 
-# %%
-torch.save(real_results, f"real_unet_results_complex.pt")
+# # %%
+# torch.save(real_results, f"real_unet_results_complex.pt")
