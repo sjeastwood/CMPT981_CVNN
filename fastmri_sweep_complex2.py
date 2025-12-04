@@ -301,21 +301,21 @@ class ComplexMRIUNetSmall(nn.Module):
                 #     m.bias.data = torch.view_as_complex(bias_real_view.contiguous())
 
                 #----- TORCHCVNN KAIMING INITIALIZATION -----
-                if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, c_nn.ConvTranspose2d)):
-                    if hasattr(m, 'weight') and m.weight is not None:
-                        c_nn.init.complex_kaiming_uniform_(m.weight, mode="fan_in")
-                    if hasattr(m, 'bias') and m.bias is not None and m.bias.is_complex():
-                        nn.init.uniform_(m.bias.real, -0.01, 0.01)
-                        nn.init.uniform_(m.bias.imag, -0.01, 0.01)
-
-
-                #----- TORCHCVNN XAVIER INITIALIZATION -----
                 # if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, c_nn.ConvTranspose2d)):
                 #     if hasattr(m, 'weight') and m.weight is not None:
-                #         c_nn.init.complex_xavier_uniform_(m.weight)
+                #         c_nn.init.complex_kaiming_uniform_(m.weight, mode="fan_in")
                 #     if hasattr(m, 'bias') and m.bias is not None and m.bias.is_complex():
                 #         nn.init.uniform_(m.bias.real, -0.01, 0.01)
                 #         nn.init.uniform_(m.bias.imag, -0.01, 0.01)
+
+
+                #----- TORCHCVNN XAVIER INITIALIZATION -----
+                if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, c_nn.ConvTranspose2d)):
+                    if hasattr(m, 'weight') and m.weight is not None:
+                        c_nn.init.complex_xavier_uniform_(m.weight, mode="fan_in")
+                    if hasattr(m, 'bias') and m.bias is not None and m.bias.is_complex():
+                        nn.init.uniform_(m.bias.real, -0.01, 0.01)
+                        nn.init.uniform_(m.bias.imag, -0.01, 0.01)
 
     def forward(self, x):
         # Encoder
@@ -584,7 +584,7 @@ for act_name in activations_to_test:
 
 # %%
 # Save
-torch.save(all_results, "cvnn_lr_sweep_results_complex_kaiming.pt")
+torch.save(all_results, "cvnn_lr_sweep_results_complex_xavier.pt")
 
 # Reload
 # all_results = torch.load("cvnn_lr_sweep_results.pt")
