@@ -312,7 +312,7 @@ class ComplexMRIUNetSmall(nn.Module):
                 #----- TORCHCVNN XAVIER INITIALIZATION -----
                 if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, c_nn.ConvTranspose2d)):
                     if hasattr(m, 'weight') and m.weight is not None:
-                        c_nn.init.complex_xavier_uniform_(m.weight, mode="fan_in")
+                        c_nn.init.complex_xavier_uniform_(m.weight)
                     if hasattr(m, 'bias') and m.bias is not None and m.bias.is_complex():
                         nn.init.uniform_(m.bias.real, -0.01, 0.01)
                         nn.init.uniform_(m.bias.imag, -0.01, 0.01)
