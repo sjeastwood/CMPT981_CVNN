@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.distributions.multivariate_normal import MultivariateNormal
 import torchvision
 import torchvision.transforms as T
 from tqdm import tqdm
@@ -102,8 +103,10 @@ class RealMnistCNN(nn.Module):
         return x
 
 class ComplexFourierMNIST(torch.utils.data.Dataset):
-    def __init__(self, mnist_dataset):
+    def __init__(self, mnist_dataset, transform=None, complex_noise=False):
         self.base = mnist_dataset
+        self.transform = transform
+        self.complex_noise = complex_noise
 
     def __len__(self):
         return len(self.base)
@@ -112,16 +115,41 @@ class ComplexFourierMNIST(torch.utils.data.Dataset):
         img, label = self.base[idx]        # img: [1,28,28], real
         img = torch.fft.fft2(img)          # convert to complex
         img = img.to(torch.complex64)
+        if self.complex_noise:
+            img = self.transform(img)
         return img, label
 
-class AddGaussianNoise(object):
+class AddRealNoise(object):
     def __init__(self, mean=0., std=0.1):
         self.std = std
         self.mean = mean
         
     def __call__(self, tensor):
         noise = torch.randn_like(tensor) * self.std + self.mean
-        return tensor + noise
+        tensor = tensor + noise
+        return torch.clamp(tensor, 0, 1)
+
+class AddComplexNoise(object):
+    def __init__(self, mean=0.+0.j, std=0.1):
+        self.mean = torch.tensor([mean.real, mean.imag])
+        var = (std**2) / 2
+        self.cov = torch.tensor([
+            [var, 0.0], 
+            [0.0, var]
+        ])
+        
+    def __call__(self, tensor):
+        tensor_view = torch.view_as_real(tensor)
+        dist = MultivariateNormal(
+            loc=self.mean.to(tensor.device), 
+            covariance_matrix=self.cov.to(tensor.device)
+        )
+        noise = dist.sample(sample_shape=tensor.shape)
+        noisy_view = tensor_view + noise
+        return torch.view_as_complex(noisy_view)
+        
+
+
 
 def compute_grad_norm(model):
     total_norm = 0.0
@@ -469,9 +497,12 @@ def visualize_single_sample(real_ds, complex_ds, idx=0):
 
 transform = T.Compose([
     T.ToTensor(),
-    AddGaussianNoise(0., 0.5),    # <--- NEW: Add Gaussian Noise (mean=0, std=0.2)
-    T.Lambda(lambda x: torch.clamp(x, 0, 1)),  # [0,1] float, shape [1,28,28]
 ])
+complex_noise = AddComplexNoise(mean=0.+0.j, std=1.0)
+
+AddRealNoise(0., 0.5),    
+T.Lambda(lambda x: torch.clamp(x, 0, 1)),
+
 
 train_real = torchvision.datasets.MNIST(root="./data", train=True, download=True, transform=transform)
 test_real  = torchvision.datasets.MNIST(root="./data", train=False, download=True, transform=transform)
@@ -479,30 +510,12 @@ test_real  = torchvision.datasets.MNIST(root="./data", train=False, download=Tru
 train_ds = ComplexFourierMNIST(train_real)
 test_ds  = ComplexFourierMNIST(test_real)
 
+train_complex = ComplexFourierMNIST(train_real, complex_transform=complex_noise)
+test_complex = ComplexFourierMNIST(test_real, complex_transform=complex_noise)
+
 
 train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=4, pin_memory=True)
 test_loader  = DataLoader(test_ds, batch_size=256, shuffle=False, num_workers=4, pin_memory=True)
-
-
-# def show_batch(loader):
-#     # Get a batch
-#     images_complex, _ = next(iter(loader))
-    
-#     # Inverse FFT to visualize what the noisy spatial image looks like
-#     # images are [B, 28, 28] complex64
-#     images_spatial = torch.fft.ifft2(images_complex)
-#     images_spatial = images_spatial.real # Take real part for visualization
-    
-#     grid = torchvision.utils.make_grid(images_spatial.unsqueeze(1)[:16], nrow=4)
-#     plt.figure(figsize=(6,6))
-#     plt.imshow(grid.permute(1, 2, 0))
-#     plt.title("Noisy Inputs (Reconstructed from FFT)")
-#     plt.axis('off')
-#     plt.show()
-
-# print("Visualizing noisy data...")
-# show_batch(train_loader)
-
 
 
 # --- Execute Visualization ---
