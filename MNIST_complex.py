@@ -34,7 +34,7 @@ import torchcvnn.nn as c_nn
 
 # --- Configuration & Constants ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-HISTORY_DIR = "history/complex/std2"
+HISTORY_DIR = "history/real_init/std5"
 
 # ==================================================================================================
 # 1. UTILITIES
@@ -195,6 +195,25 @@ class ComplexMnistCNN(nn.Module):
             act,
             nn.Linear(128, 10, dtype=torch.complex64),
         )
+
+        self._init_complex_weights()
+
+    def _init_complex_weights(self):
+        """
+        Initialize complex-valued weights using Kaiming/He initialization.
+        For complex weights, we initialize real and imaginary parts independently
+        with variance/2 for each part to maintain the overall variance.
+        """
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+
+                #----- TORCHCVNN KAIMING INITIALIZATION -----
+                if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, c_nn.ConvTranspose2d)):
+                    if hasattr(m, 'weight') and m.weight is not None:
+                        c_nn.init.complex_kaiming_uniform_(m.weight, mode="fan_in")
+                    if hasattr(m, 'bias') and m.bias is not None and m.bias.is_complex():
+                        nn.init.uniform_(m.bias.real, -0.01, 0.01)
+                        nn.init.uniform_(m.bias.imag, -0.01, 0.01)
 
     def forward(self, x):
         x = self.features(x)
@@ -613,15 +632,18 @@ def plot_experiment(log_dir, metric, compare_by, fixed_params=None, semilogy=Fal
 if __name__ == "__main__":
     # --- Config ---
     BATCH_SIZE = 128
-    NOISE_STD = 0.2
+    NOISE_STD = 0.5
     NUM_EPOCHS = 50
     
     # Activation functions to test (including underscores)
-    ACTIVATIONS = ["modrelu", "cardioid", "c_relu", "c_elu", "c_gelu"]
+    ACTIVATIONS = ["modrelu", "cardioid"]
+    # ACTIVATIONS = ["modrelu", "cardioid", "c_relu", "c_elu", "c_gelu"]
     
     # Learning rates (10^-1 to 10^-5)
-    LEARNING_RATES = [1e-1, 1e-2, 1e-3, 1e-4, 1e-5]
+    # LEARNING_RATES = [1e-1, 1e-2, 1e-3, 1e-4, 1e-5]
+    LEARNING_RATES = [1e-1, 1e-2, 1e-3, 1e-4]
     
+    # OPTIMIZERS = ['Nesterov']
     OPTIMIZERS = ['Adam', 'SGD', 'Nesterov']
 
     # --- 1. Prepare Data ---
@@ -632,14 +654,14 @@ if __name__ == "__main__":
     raw_train_ds = loaders['raw_train'].dataset
     real_train_ds = loaders['real_train'].dataset
     comp_train_ds = loaders['comp_train'].dataset
-    visualize_single_sample(raw_train_ds, real_train_ds, idx=0, noise='real')
-    visualize_single_sample(raw_train_ds, comp_train_ds, idx=0, noise='complex')
+    # visualize_single_sample(raw_train_ds, real_train_ds, idx=0, noise='real')
+    # visualize_single_sample(raw_train_ds, comp_train_ds, idx=0, noise='complex')
 
     # --- 3. Run Experiments ---
     # Uncomment the line below to run the training loop
     run_comprehensive_experiment(
-        loaders['comp_train'], 
-        loaders['comp_test'], 
+        loaders['real_train'], 
+        loaders['real_test'], 
         ACTIVATIONS, 
         LEARNING_RATES, 
         OPTIMIZERS, 
